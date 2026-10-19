@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(../Dino-original/**)",
+      "Edit(../Dino-original/**)",
+      "Edit(./game.min.js)",
+      "WebFetch",
+      "WebSearch",
+      "Bash(curl:*)",
+      "Bash(wget:*)"
+    ]
+  }
+}

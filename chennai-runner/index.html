@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Chennai Run</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #1d1b2e;
+    color: #f4efe3;
+    font-family: "Trebuchet MS", system-ui, sans-serif;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 0 16px;
+    box-sizing: border-box;
+  }
+  h1 { margin: 0; font-size: 22px; letter-spacing: 2px; }
+  canvas {
+    width: 100%;
+    max-width: 800px;
+    aspect-ratio: 800 / 320;
+    border-radius: 8px;
+    box-shadow: 0 6px 24px rgba(0,0,0,.45);
+    touch-action: none;
+    display: block;
+  }
+  p.help { margin: 0; font-size: 13px; opacity: .75; text-align: center; }
+</style>
+</head>
+<body>
+<h1>CHENNAI RUN</h1>
+<canvas id="game" width="800" height="320"></canvas>
+<p class="help">Space / ↑ jump (hold for higher) · ↓ duck or drop fast · Tap to jump on mobile</p>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---------------------------------------------------------------------------
+  // Setup
+  // ---------------------------------------------------------------------------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width;
+  const H = canvas.height;
+  const GROUND_Y = 275;          // y of the kid's feet when on the road
+  const KID_X = 90;              // kid's left edge
+  const FRAME_MS = 1000 / 60;    // physics unit: one 60 fps frame
+
+  // Jump tuning (see JUMP-SPEC.md, sections 2.1-2.6). Heights are px above the road.
+  const JUMP = {
+    gravity: 0.47,               // px/frame^2 added to velocity every frame
+    launchVelocity: -11.5,       // base upward velocity (negative = up)
+    speedBonusDivisor: 10,       // launch gets an extra -speed/10
+    capVelocity: -5,             // upward speed is clamped to this on release / at cap
+    minHeight: 30,               // release is ignored until the kid is this high
+    capHeight: 56,               // above this the upward speed is clamped automatically
+    dropStartVelocity: 1,        // velocity set when Down is pressed in mid-air
+    dropMultiplier: 3            // position steps are 3x while fast-dropping
+  };
+
+  // Game speed (px/frame) ramps up over time.
+  const START_SPEED = 6;
+  const MAX_SPEED = 13;
+  const ACCEL = 0.001;
+  const DIST_TO_METRES = 0.025;
+  const COFFEE_BONUS = 25;
+
+  // ---------------------------------------------------------------------------
+  // Player
+  // ---------------------------------------------------------------------------
+  const kid = {
+    y: GROUND_Y,                 // feet position (canvas y grows downward)
+    vy: 0,
+    airborne: false,
+    passedMinHeight: false,
+    fastDrop: false,
+    crouching: false,
+    runPhase: 0,
+
+    reset() {
+      this.y = GROUND_Y;
+      this.vy = 0;
+      this.airborne = false;
+      this.passedMinHeight = false;
+      this.fastDrop = false;
+      this.crouching = false;
+    },
+
+    // Spec 2.1: only from the ground and not while ducking; faster game = stronger launch.
+    jump(gameSpeed) {
+      if (this.airborne || this.crouching) return;
+      this.vy = JUMP.launchVelocity - gameSpeed / JUMP.speedBonusDivisor;
+      this.airborne = true;
+      this.passedMinHeight = false;
+      this.fastDrop = false;
+    },
+
+    // Spec 2.4: clamp the rise to capVelocity, but only after the minimum height.
+    // Called on release of the jump key and automatically above capHeight.
+    cutJump() {
+      if (this.passedMinHeight && this.vy < JUMP.capVelocity) {
+        this.vy = JUMP.capVelocity;
+      }
+    },
+
+    // Spec 2.3: Down in mid-air -> start falling now, with 3x position steps.
+    startFastDrop() {
+      this.fastDrop = true;
+      this.vy = JUMP.dropStartVelocity;
+    },
+
+    // Spec 2.2-2.5: one physics step. `frames` = elapsed ms / (1000/60).
+    stepJump(frames) {
+      const mult = this.fastDrop ? JUMP.dropMultiplier : 1;
+      // Explicit Euler: move with the old velocity (whole pixels), then apply gravity.
+      this.y += Math.round(this.vy * mult * frames);
+      this.vy += JUMP.gravity * frames;
+
+      const height = GROUND_Y - this.y;
+      if (height > JUMP.minHeight || this.fastDrop) this.passedMinHeight = true;
+      if (height > JUMP.capHeight || this.fastDrop) this.cutJump();
+
+      // Landing: only once the feet have gone below the road, then snap back.
+      if (this.y > GROUND_Y) {
+        const landDucking = this.fastDrop;   // still holding Down -> land in a duck
+        this.reset();
+        this.crouching = landDucking;
+      }
+    },
+
+    hitbox() {
+      if (this.crouching) return { x: KID_X + 2, y: this.y - 27, w: 40, h: 27 };
+      return { x: KID_X + 6, y: this.y - 50, w: 20, h: 50 };
+    }
+  };
+
+  // ---------------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------------
+  let state = 'start';           // 'start' | 'playing' | 'over'
+  let speed = START_SPEED;
+  let distance = 0;
+  let bonus = 0;
+  let cupsCollected = 0;
+  let obstacles = [];
+  let coffees = [];
+  let popups = [];
+  let nextGap = 0;
+  let lastTypes = [];
+  let worldScroll = 0;
+  let overAt = 0;
+  let lastTime = 0;
+  let highScore = 0;
+  try { highScore = +localStorage.getItem('chennaiRunHigh') || 0; } catch (e) {}
+
+  function metres() { return Math.floor(distance * DIST_TO_METRES); }
+  function score() { return metres() + bonus; }
+
+  function startGame() {
+    state = 'playing';
+    speed = START_SPEED;
+    distance = 0;
+    bonus = 0;
+    cupsCollected = 0;
+    obstacles = [];
+    coffees = [];
+    popups = [];
+    lastTypes = [];
+    nextGap = 500;               // give the player a moment before the first obstacle
+    kid.reset();
+  }
+
+  function endGame() {
+    state = 'over';
+    overAt = performance.now();
+    kid.fastDrop = false;
+    if (score() > highScore) {
+      highScore = score();
+      try { localStorage.setItem('chennaiRunHigh', String(highScore)); } catch (e) {}
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Obstacles & collectibles
+  // ---------------------------------------------------------------------------
+  // Each type: width, collision box relative to (x, GROUND_Y), and a draw function.
+  const OBSTACLE_TYPES = {
+    pothole: { w: 60, box: { dx: 14, dy: -2, w: 32, h: 12 }, minSpeed: 0 },
+    cow:     { w: 78, box: { dx: 6,  dy: -32, w: 68, h: 32 }, minSpeed: 0 },
+    auto:    { w: 70, box: { dx: 4,  dy: -52, w: 62, h: 52 }, minSpeed: 6.5 },
+    banner:  { w: 84, box: { dx: 8,  dy: -GROUND_Y, w: 68, h: GROUND_Y - 35 }, minSpeed: 7.5 }
+  };
+
+  function pickType() {
+    const options = Object.keys(OBSTACLE_TYPES).filter(t =>
+      OBSTACLE_TYPES[t].minSpeed <= speed &&
+      !(lastTypes.length >= 2 && lastTypes[0] === t && lastTypes[1] === t));
+    const t = options[Math.floor(Math.random() * options.length)];
+    lastTypes.unshift(t);
+    lastTypes.length = Math.min(lastTypes.length, 2);
+    return t;
+  }
+
+  function spawnObstacle() {
+    const type = pickType();
+    const def = OBSTACLE_TYPES[type];
+    obstacles.push({ type, x: W + 10, w: def.w, seed: Math.random() });
+    // Gap scales with speed so a full jump always has room to land.
+    nextGap = def.w + speed * (40 + Math.random() * 30) + 40;
+
+    // Sometimes place a coffee tumbler in the gap: low (run through) or high (jump for it).
+    if (Math.random() < 0.55) {
+      const high = Math.random() < 0.5;
+      coffees.push({ x: W + 10 + def.w + nextGap * 0.5, y: high ? GROUND_Y - 85 : GROUND_Y - 22, bob: Math.random() * 6 });
+    }
+  }
+
+  function obstacleBox(o) {
+    const b = OBSTACLE_TYPES[o.type].box;
+    return { x: o.x + b.dx, y: GROUND_Y + b.dy, w: b.w, h: b.h };
+  }
+
+  function overlap(a, b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Update
+  // ---------------------------------------------------------------------------
+  function update(dt) {
+    const frames = dt / FRAME_MS;
+    worldScroll += (state === 'playing' ? speed : 1.5) * frames;
+    kid.runPhase += (state === 'playing' ? speed : 0) * frames * 0.04;
+
+    if (state !== 'playing') return;
+
+    if (kid.airborne) kid.stepJump(frames);
+
+    if (speed < MAX_SPEED) speed = Math.min(MAX_SPEED, speed + ACCEL * frames);
+    distance += speed * frames;
+
+    const move = speed * frames;
+    for (const o of obstacles) o.x -= move;
+    for (const c of coffees) c.x -= move;
+    obstacles = obstacles.filter(o => o.x + o.w > -20);
+    coffees = coffees.filter(c => c.x > -30 && !c.taken);
+
+    const last = obstacles[obstacles.length - 1];
+    if (!last || last.x + last.w < W - nextGap + 10) spawnObstacle();
+
+    const kb = kid.hitbox();
+    for (const o of obstacles) {
+      if (overlap(kb, obstacleBox(o))) { endGame(); return; }
+    }
+    for (const c of coffees) {
+      if (!c.taken && overlap(kb, { x: c.x - 8, y: c.y - 12, w: 16, h: 24 })) {
+        c.taken = true;
+        bonus += COFFEE_BONUS;
+        cupsCollected++;
+        popups.push({ x: c.x, y: c.y - 16, life: 40 });
+      }
+    }
+    for (const p of popups) { p.life -= frames; p.y -= 0.8 * frames; }
+    popups = popups.filter(p => p.life > 0);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Drawing helpers
+  // ---------------------------------------------------------------------------
+  function rect(x, y, w, h, color) { ctx.fillStyle = color; ctx.fillRect(x, y, w, h); }
+  function circle(x, y, r, color) { ctx.fillStyle = color; ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); }
+  function ellipse(x, y, rx, ry, color) { ctx.fillStyle = color; ctx.beginPath(); ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2); ctx.fill(); }
+  function poly(points, color) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(points[0], points[1]);
+    for (let i = 2; i < points.length; i += 2) ctx.lineTo(points[i], points[i + 1]);
+    ctx.closePath();
+    ctx.fill();
+  }
+  function wrap(v, m) { return ((v % m) + m) % m; }
+
+  // ---------------------------------------------------------------------------
+  // Background: sky, skyline with gopuram, Marina sea, sand, road
+  // ---------------------------------------------------------------------------
+  const SKYLINE_LEN = 1400;
+  const skyline = (function buildSkyline() {
+    const items = [];
+    let x = 0, n = 0;
+    while (x < SKYLINE_LEN) {
+      n++;
+      if (n % 6 === 3) { items.push({ kind: 'gopuram', x, w: 90, h: 120 }); x += 100; continue; }
+      if (n % 11 === 7) { items.push({ kind: 'lighthouse', x, w: 22, h: 105 }); x += 36; continue; }
+      const w = 30 + ((n * 37) % 45);
+      const h = 35 + ((n * 53) % 70);
+      items.push({ kind: 'building', x, w, h, win: n % 3 });
+      x += w + 4 + (n % 4) * 6;
+    }
+    return items;
+  })();
+
+  function drawGopuram(x, base, w, h, color) {
+    // Tiered tower: a plain base, then shrinking tiers, a barrel-vault top and kalasams.
+    rect(x + w * 0.1, base - h * 0.22, w * 0.8, h * 0.22, color);
+    const tiers = 6;
+    const tierH = (h * 0.62) / tiers;
+    for (let i = 0; i < tiers; i++) {
+      const y0 = base - h * 0.22 - i * tierH;
+      const inset0 = w * 0.1 + i * w * 0.05;
+      const inset1 = w * 0.1 + (i + 1) * w * 0.05;
+      poly([x + inset0, y0, x + w - inset0, y0, x + w - inset1, y0 - tierH, x + inset1, y0 - tierH], color);
+      // ledge
+      rect(x + inset1 - 2, y0 - tierH, w - 2 * inset1 + 4, 2, color);
+    }
+    const topY = base - h * 0.84;
+    const topInset = w * 0.1 + tiers * w * 0.05;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.ellipse(x + w / 2, topY, (w - 2 * topInset) / 2 + 3, h * 0.07, 0, Math.PI, 0);
+    ctx.fill();
+    for (let k = -1; k <= 1; k++) {
+      const kx = x + w / 2 + k * (w - 2 * topInset) * 0.32;
+      rect(kx - 1.5, topY - h * 0.07 - 9, 3, 9, color);
+      circle(kx, topY - h * 0.07 - 10, 2.5, color);
+    }
+  }
+
+  function drawBackground() {
+    // Sky
+    const sky = ctx.createLinearGradient(0, 0, 0, 190);
+    sky.addColorStop(0, '#ffb36b');
+    sky.addColorStop(0.55, '#ffd9a0');
+    sky.addColorStop(1, '#ffe9c4');
+    ctx.fillStyle = sky;
+    ctx.fillRect(0, 0, W, 190);
+    circle(640, 70, 26, '#fff4d6');
+
+    // Skyline (slow parallax)
+    const horizon = 178;
+    const off = worldScroll * 0.15;
+    for (let rep = -1; rep <= 1; rep++) {
+      const baseX = rep * SKYLINE_LEN - wrap(off, SKYLINE_LEN);
+      for (const b of skyline) {
+        const x = baseX + b.x;
+        if (x > W || x + b.w < 0) continue;
+        if (b.kind === 'gopuram') {
+          drawGopuram(x, horizon, b.w, b.h, '#8a5a6e');
+        } else if (b.kind === 'lighthouse') {
+          poly([x, horizon, x + b.w, horizon, x + b.w * 0.75, horizon - b.h, x + b.w * 0.25, horizon - b.h], '#9b6b7c');
+          rect(x + b.w * 0.15, horizon - b.h - 10, b.w * 0.7, 10, '#9b6b7c');
+          rect(x + b.w * 0.15, horizon - b.h * 0.6, b.w * 0.7, 6, '#c9443a');
+          rect(x + b.w * 0.2, horizon - b.h * 0.3, b.w * 0.6, 6, '#c9443a');
+        } else {
+          rect(x, horizon - b.h, b.w, b.h, '#a07385');
+          ctx.fillStyle = 'rgba(255,230,170,0.55)';
+          for (let wy = horizon - b.h + 6; wy < horizon - 8; wy += 10) {
+            for (let wx = x + 5; wx < x + b.w - 6; wx += 9) {
+              if (((wx + wy + b.win) | 0) % 3 !== 0) ctx.fillRect(wx, wy, 4, 5);
+            }
+          }
+        }
+      }
+    }
+
+    // Sea at Marina Beach
+    const sea = ctx.createLinearGradient(0, horizon, 0, 215);
+    sea.addColorStop(0, '#3b7fa6');
+    sea.addColorStop(1, '#5aa6c4');
+    ctx.fillStyle = sea;
+    ctx.fillRect(0, horizon, W, 37);
+    ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+    ctx.lineWidth = 2;
+    const waveOff = wrap(worldScroll * 0.35, 60);
+    for (let row = 0; row < 3; row++) {
+      const wy = horizon + 8 + row * 10;
+      ctx.beginPath();
+      for (let wx = -60 - waveOff + row * 20; wx < W + 60; wx += 60) {
+        ctx.moveTo(wx, wy);
+        ctx.quadraticCurveTo(wx + 8, wy - 4, wx + 16, wy);
+      }
+      ctx.stroke();
+    }
+
+    // Sand
+    rect(0, 215, W, 32, '#e8cf98');
+    ctx.fillStyle = '#d6b97c';
+    const sandOff = wrap(worldScroll * 0.6, 40);
+    for (let sx = -sandOff; sx < W; sx += 40) ctx.fillRect(sx, 228, 3, 2);
+
+    // Road
+    rect(0, 247, W, H - 247, '#4a4a52');
+    rect(0, 247, W, 4, '#7c7c86');
+    ctx.fillStyle = '#f2e6b8';
+    const dashOff = wrap(worldScroll, 70);
+    for (let dx = -dashOff; dx < W; dx += 70) ctx.fillRect(dx, 298, 36, 4);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Characters & objects
+  // ---------------------------------------------------------------------------
+  const SKIN = '#8d5a3b';
+  const HAIR = '#1b1410';
+
+  function drawKid() {
+    const x = KID_X;
+    const fy = Math.round(kid.y);
+    if (kid.crouching) {
+      // Low crouch-run: body leaning forward, head near the front.
+      const step = Math.sin(kid.runPhase * 2) * 3;
+      rect(x + 4, fy - 6 + step * 0.3, 8, 6, '#1a1a1a');             // back shoe
+      rect(x + 26, fy - 6 - step * 0.3, 8, 6, '#1a1a1a');            // front shoe
+      rect(x + 6, fy - 12, 26, 8, '#23305e');                         // shorts
+      rect(x + 2, fy - 26, 16, 14, '#e08a2c');                        // backpack
+      rect(x + 12, fy - 22, 22, 11, '#f4f4f0');                       // shirt
+      rect(x + 28, fy - 18, 4, 8, '#c62828');                         // tie
+      circle(x + 37, fy - 18, 7, SKIN);                               // head
+      ctx.fillStyle = HAIR;
+      ctx.beginPath(); ctx.arc(x + 37, fy - 19, 7.5, Math.PI * 1.05, Math.PI * 1.95); ctx.fill();
+      circle(x + 40, fy - 19, 1.2, '#000');
+      return;
+    }
+
+    const air = kid.airborne;
+    const swing = air ? 0 : Math.sin(kid.runPhase * 2);
+    // Legs (white socks, black shoes)
+    const legA = air ? -4 : swing * 6;
+    const legB = air ? 4 : -swing * 6;
+    function leg(dx, color) {
+      rect(x + 10 + dx, fy - 16, 6, 10, SKIN);
+      rect(x + 10 + dx, fy - 8, 6, 4, '#ffffff');
+      rect(x + 9 + dx, fy - 4, 9, 4, color);
+    }
+    leg(legB, '#111');
+    // Backpack
+    rect(x - 1, fy - 42, 10, 18, '#e08a2c');
+    rect(x + 1, fy - 40, 6, 3, '#b56a1c');
+    // Shorts
+    rect(x + 7, fy - 25, 18, 10, '#23305e');
+    leg(legA, '#1a1a1a');
+    // Shirt
+    rect(x + 7, fy - 41, 18, 17, '#f4f4f0');
+    rect(x + 7, fy - 41, 18, 2, '#d9d9d2');
+    // Tie
+    poly([x + 15, fy - 40, x + 18, fy - 40, x + 19, fy - 30, x + 16.5, fy - 27, x + 14, fy - 30], '#c62828');
+    // Arm swinging
+    const armSwing = air ? -6 : -swing * 5;
+    rect(x + 13 + armSwing * 0.4, fy - 38, 5, 13, '#f4f4f0');
+    rect(x + 13 + armSwing * 0.6, fy - 27, 5, 4, SKIN);
+    // Head
+    rect(x + 13, fy - 44, 6, 4, SKIN);
+    circle(x + 17, fy - 50, 8, SKIN);
+    ctx.fillStyle = HAIR;
+    ctx.beginPath(); ctx.arc(x + 16, fy - 51, 8.5, Math.PI * 1.0, Math.PI * 1.95); ctx.fill();
+    rect(x + 8, fy - 52, 4, 5, HAIR);
+    circle(x + 21, fy - 51, 1.3, '#000');
+    rect(x + 19, fy - 46, 4, 1.5, '#5a2a1a');                         // mouth
+  }
+
+  function drawPothole(o) {
+    const cx = o.x + o.w / 2;
+    ellipse(cx, GROUND_Y + 4, o.w / 2, 8, '#2a2a2e');
+    ellipse(cx, GROUND_Y + 5, o.w / 2 - 6, 5, '#141416');
+    ellipse(cx + 6, GROUND_Y + 6, 8, 2, 'rgba(120,160,200,0.45)');    // puddle glint
+    rect(o.x + 2, GROUND_Y - 2, 5, 3, '#6d6d75');
+    rect(o.x + o.w - 8, GROUND_Y - 1, 6, 2, '#6d6d75');
+  }
+
+  function drawCow(o) {
+    const x = o.x, g = GROUND_Y;
+    // Lying body
+    ctx.fillStyle = '#f3efe6';
+    ctx.beginPath(); ctx.ellipse(x + 34, g - 14, 30, 14, 0, 0, Math.PI * 2); ctx.fill();
+    ellipse(x + 22, g - 18, 9, 6, '#3a2d26');
+    ellipse(x + 44, g - 12, 7, 5, '#3a2d26');
+    // Folded legs
+    rect(x + 12, g - 4, 16, 4, '#e2ddd0');
+    rect(x + 40, g - 4, 16, 4, '#e2ddd0');
+    // Tail
+    ctx.strokeStyle = '#d8d2c4'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x + 5, g - 16); ctx.quadraticCurveTo(x - 4, g - 8, x + 2, g - 2); ctx.stroke();
+    // Head resting forward, sleeping
+    ellipse(x + 66, g - 14, 10, 8, '#f3efe6');
+    ellipse(x + 73, g - 11, 5, 4, '#e6b8a8');
+    // Painted horns (blue and orange, as for Pongal)
+    poly([x + 60, g - 20, x + 58, g - 32, x + 63, g - 21], '#2f6fd6');
+    poly([x + 68, g - 21, x + 72, g - 32, x + 71, g - 20], '#ef7d1a');
+    rect(x + 61, g - 16, 4, 1.5, '#333');                             // closed eye
+    // Zzz
+    ctx.fillStyle = '#4a3b6b';
+    ctx.font = 'bold 11px sans-serif';
+    const t = (worldScroll * 0.02) % 1;
+    ctx.fillText('z', x + 74, g - 30 - t * 6);
+    ctx.font = 'bold 8px sans-serif';
+    ctx.fillText('z', x + 82, g - 40 - t * 6);
+  }
+
+  function drawAuto(o) {
+    const x = o.x, g = GROUND_Y;
+    // Wheels
+    circle(x + 14, g - 7, 7, '#1a1a1a');
+    circle(x + 56, g - 7, 7, '#1a1a1a');
+    circle(x + 14, g - 7, 3, '#888');
+    circle(x + 56, g - 7, 3, '#888');
+    // Lower body (yellow) and black canopy
+    poly([x + 2, g - 10, x + 68, g - 10, x + 68, g - 28, x + 58, g - 34, x + 2, g - 30], '#f5c518');
+    poly([x + 4, g - 30, x + 54, g - 34, x + 62, g - 50, x + 22, g - 54, x + 4, g - 46], '#1d1d1d');
+    // Green stripe & window opening
+    rect(x + 2, g - 18, 66, 3, '#1f8a4c');
+    rect(x + 22, g - 44, 26, 12, '#3a3a3a');
+    // Front: windscreen and headlight
+    poly([x + 54, g - 34, x + 62, g - 50, x + 66, g - 36], '#9fd3e6');
+    circle(x + 66, g - 22, 3, '#fff6b0');
+    // Number plate
+    rect(x + 6, g - 26, 12, 5, '#fff');
+  }
+
+  function drawBanner(o) {
+    const x = o.x, g = GROUND_Y;
+    const bottom = g - 35;
+    // Rope across from top of screen
+    ctx.strokeStyle = '#5b3a1e'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x + 10, 0); ctx.lineTo(x + 10, bottom - 34); ctx.moveTo(x + 74, 0); ctx.lineTo(x + 74, bottom - 34); ctx.stroke();
+    // Mango-leaf thoranam
+    for (let i = 0; i < 6; i++) {
+      poly([x + 8 + i * 13, bottom - 46, x + 16 + i * 13, bottom - 46, x + 12 + i * 13, bottom - 36], i % 2 ? '#2e8b3e' : '#4caf50');
+    }
+    // Banner cloth
+    rect(x + 6, bottom - 36, 72, 32, '#d81b60');
+    rect(x + 6, bottom - 36, 72, 4, '#ffc107');
+    rect(x + 6, bottom - 8, 72, 4, '#ffc107');
+    ctx.fillStyle = '#fff8e1';
+    ctx.font = 'bold 12px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('POOJA', x + 42, bottom - 15);
+    ctx.textAlign = 'left';
+    // Tassels hanging below
+    for (let i = 0; i < 5; i++) {
+      rect(x + 12 + i * 15, bottom - 4, 2, 4, '#ffc107');
+      circle(x + 13 + i * 15, bottom + 1, 2.5, '#ff9800');
+    }
+  }
+
+  function drawTumbler(c) {
+    const bob = Math.sin(worldScroll * 0.08 + c.bob) * 2;
+    const x = c.x, y = c.y + bob;
+    // Dabarah (saucer bowl) with a steel tumbler sitting in it
+    ellipse(x, y + 9, 11, 4, '#9ea7ad');
+    poly([x - 6, y - 10, x + 6, y - 10, x + 5, y + 8, x - 5, y + 8], '#c9d1d6');
+    rect(x - 6, y - 11, 12, 2, '#e8eef1');
+    rect(x - 3, y - 8, 2, 14, 'rgba(255,255,255,0.7)');
+    ellipse(x, y - 10, 5, 1.5, '#8a5a2e');                            // frothy coffee
+    // Steam
+    ctx.strokeStyle = 'rgba(255,255,255,0.8)'; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(x - 2, y - 13); ctx.quadraticCurveTo(x - 5, y - 18, x - 1, y - 22);
+    ctx.moveTo(x + 2, y - 13); ctx.quadraticCurveTo(x + 5, y - 18, x + 2, y - 22);
+    ctx.stroke();
+  }
+
+  function drawBus() {
+    // The school bus the kid is chasing, waiting just off the right edge on the start screen.
+    const x = 640, g = GROUND_Y;
+    rect(x, g - 52, 150, 42, '#f2a900');
+    rect(x, g - 22, 150, 4, '#1a1a1a');
+    for (let i = 0; i < 5; i++) rect(x + 8 + i * 27, g - 46, 20, 14, '#bfe3f0');
+    ctx.fillStyle = '#1a1a1a';
+    ctx.font = 'bold 10px sans-serif';
+    ctx.fillText('SCHOOL BUS', x + 40, g - 26);
+    circle(x + 28, g - 9, 9, '#1a1a1a');
+    circle(x + 120, g - 9, 9, '#1a1a1a');
+  }
+
+  // ---------------------------------------------------------------------------
+  // HUD & screens
+  // ---------------------------------------------------------------------------
+  function pad(n, len) { return String(n).padStart(len, '0'); }
+
+  function drawHud() {
+    ctx.font = 'bold 16px "Courier New", monospace';
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#3b2340';
+    ctx.fillText('HI ' + pad(highScore, 5) + '   SCORE ' + pad(score(), 5), W - 16, 26);
+    ctx.textAlign = 'left';
+    ctx.fillText(metres() + ' m', 16, 26);
+    ctx.fillText('☕ x' + cupsCollected, 16, 46);
+
+    ctx.font = 'bold 13px sans-serif';
+    for (const p of popups) {
+      ctx.fillStyle = 'rgba(90,40,10,' + Math.min(1, p.life / 20) + ')';
+      ctx.fillText('+' + COFFEE_BONUS, p.x - 10, p.y);
+    }
+  }
+
+  function panel(lines) {
+    ctx.fillStyle = 'rgba(29,27,46,0.72)';
+    const ph = 30 + lines.length * 26;
+    ctx.fillRect(W / 2 - 220, 70, 440, ph);
+    ctx.textAlign = 'center';
+    lines.forEach((l, i) => {
+      ctx.font = l.big ? 'bold 30px "Trebuchet MS", sans-serif' : '16px "Trebuchet MS", sans-serif';
+      ctx.fillStyle = l.color || '#f4efe3';
+      ctx.fillText(l.text, W / 2, 100 + i * 26 + (l.big ? 4 : 0));
+    });
+    ctx.textAlign = 'left';
+  }
+
+  function render() {
+    drawBackground();
+    for (const o of obstacles) {
+      if (o.type === 'pothole') drawPothole(o);
+      else if (o.type === 'cow') drawCow(o);
+      else if (o.type === 'auto') drawAuto(o);
+      else drawBanner(o);
+    }
+    for (const c of coffees) drawTumbler(c);
+    if (state === 'start') drawBus();
+    drawKid();
+
+    if (state === 'start') {
+      panel([
+        { text: 'CHENNAI RUN', big: true, color: '#ffc94d' },
+        { text: 'Late for school! Catch the bus.' },
+        { text: 'Space / ↑ jump  ·  ↓ duck  ·  tap to jump' },
+        { text: 'Press Space or tap to start', color: '#ffc94d' }
+      ]);
+    } else {
+      drawHud();
+      if (state === 'over') {
+        panel([
+          { text: 'MISSED THE BUS!', big: true, color: '#ff7a6b' },
+          { text: 'Distance ' + metres() + ' m  ·  Coffee +' + bonus + '  ·  Score ' + score() },
+          { text: 'Press Space to restart', color: '#ffc94d' }
+        ]);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Input
+  // ---------------------------------------------------------------------------
+  const JUMP_KEYS = { Space: 1, ArrowUp: 1 };
+
+  function pressJump() {
+    if (state === 'start') { startGame(); kid.jump(speed); return; }
+    if (state === 'over') {
+      if (performance.now() - overAt > 400) startGame();
+      return;
+    }
+    kid.jump(speed);
+  }
+
+  function releaseJump() {
+    if (state === 'playing') kid.cutJump();      // early release (spec 2.4)
+  }
+
+  function pressDown() {
+    if (state !== 'playing') return;
+    if (kid.airborne) kid.startFastDrop();       // spec 2.3
+    else kid.crouching = true;
+  }
+
+  function releaseDown() {
+    kid.fastDrop = false;
+    kid.crouching = false;
+  }
+
+  window.addEventListener('keydown', e => {
+    if (JUMP_KEYS[e.code]) {
+      e.preventDefault();
+      if (!e.repeat) pressJump();
+    } else if (e.code === 'ArrowDown') {
+      e.preventDefault();
+      if (!e.repeat) pressDown();
+    }
+  });
+
+  window.addEventListener('keyup', e => {
+    if (JUMP_KEYS[e.code]) releaseJump();
+    else if (e.code === 'ArrowDown') releaseDown();
+  });
+
+  canvas.addEventListener('touchstart', e => { e.preventDefault(); pressJump(); }, { passive: false });
+  canvas.addEventListener('touchend', e => { e.preventDefault(); releaseJump(); }, { passive: false });
+
+  // Don't let a long hidden-tab pause turn into one giant physics step.
+  document.addEventListener('visibilitychange', () => { lastTime = 0; });
+
+  // ---------------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------------
+  function loop(now) {
+    const dt = lastTime ? now - lastTime : FRAME_MS;
+    lastTime = now;
+    update(dt);
+    render();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
